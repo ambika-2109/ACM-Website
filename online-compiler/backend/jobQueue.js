@@ -1,55 +1,103 @@
 const fs = require("fs");
 const path = require("path");
 const Queue = require("bull");
+const mongoose = require("mongoose");
 const outputs = path.join(__dirname, "outputs");
 
 const Job = require("./models/Job");
-const { executeCode } = require("./executeCode");
+const Problem = require("./models/Problem");
+const {executeCode} = require("./executeCode");
+const {Mongoose} = require("mongoose");
 
 const jobQueue = new Queue("job-runner-queue");
 const NUM_WORKERS = 5;
+const DEFAULT_MEM_LIMIT = 700000; // 700MB by default, unless overruled by problem
 
-jobQueue.process(NUM_WORKERS, async ({ data }) => {
-  const jobId = data.id;
-  const job = await Job.findById(jobId);
-  if (job === undefined) {
-    throw Error(`cannot find Job with id ${jobId}`);
-  }
-  // console.log(job.input);
-  try {
-    let output;
-    job["startedAt"] = new Date();
+jobQueue.process(NUM_WORKERS, async ({data}) => {
+    const jobId = data.id;
+    const job = await Job.findById(jobId);
+    const outputPath = path.join(__dirname, "outputs");
 
-    output = await executeCode(job.filepath, job.input, job.language);
+    let execTime = 0;
+    let output = "";
+    let isIncorrect = false;
 
-    job["completedAt"] = new Date();
-    job["output"] = output;
-    job["status"] = "success";
+    if (job === undefined) {
+        throw Error(`cannot find Job with id ${jobId}`);
+    }
+    try {
+        if (job.probID != undefined) {
+            const problem = await Problem.findById(mongoose.Types.ObjectId(job.probID));
+            for (let i = 0; i < problem.testCases.length; i++) {
+                let op = await executeCode(
+                    job.filepath,
+                    problem.testCases[i].input,
+                    job.language,
+                    problem.constraints.memLim == undefined ? DEFAULT_MEM_LIMIT : problem.constraints.memLim
+                );
 
-    await job.save();
+                if (op.result === problem.testCases[i].output && op.execTime <= problem.constraints.timLim) {
+                    execTime += op.execTime;
+                    // output += `test case ${i} PASSED\n`;//not necessary to show
+                } else {
+                    console.log(op.execTime, problem.constraints.timLim);
+                    output += `test case ${i} FAILED\n\n`;
+                    output += `your output : ${op.result}\ncorrect output : ${problem.testCases[i].output}\n`;
+                    output += `\nIf the Output is correct you have not met the Time constrains, \nexecution time of your code is : ${op.execTime} ms\n\n`;
+                    isIncorrect = true;
+                    break;
+                }
+            }
+            if (isIncorrect) {
+                output += "Incorrect Output for one or more Test Cases\n";
+            } else {
+                output += "Correct Output for all Test Cases\n";
+                //set flag for this problem in account wide progress array
+            }
+        } else {
+            execOutput = await executeCode(job.filepath, job.input, job.language, DEFAULT_MEM_LIMIT);
+            output = execOutput.result;
+            execTime = execOutput.execTime;
+            console.log(execTime);
+        }
 
-    fs.unlinkSync(job.filepath); //delete the code file on the server
+        job["output"] = output;
+        job["status"] = "success";
+        job["executionTime"] = execTime;
 
-    return true;
-  } catch (err) {
-    job["completedAt"] = new Date();
-    job["output"] = JSON.stringify(err);
-    job["status"] = "error";
-    await job.save();
-    throw Error(JSON.stringify(err));
-  }
+        await job.save();
+
+        fs.unlinkSync(job.filepath); //delete the code file on the server
+
+        if (job.language === "cpp" || job.language === "c") {
+            const jobId = path.basename(job.filepath).split(".")[0];
+            const executable = path.join(outputPath, `${jobId}.out`);
+            fs.unlinkSync(executable); //delete the executable file file on the server
+        }
+
+        return true;
+    } catch (err) {
+        console.log(err);
+        job["output"] = JSON.stringify(err);
+        job["status"] = "error";
+        await job.save();
+
+        fs.unlinkSync(job.filepath); //delete the code file on the server
+
+        throw Error(JSON.stringify(err));
+    }
 });
 
-jobQueue.on("failed", (error) => {
-  console.error(error.data.id, error.failedReason);
+jobQueue.on("failed", error => {
+    console.error(error.data.id, error.failedReason);
 });
 
-const addJobToQueue = async (jobId) => {
-  jobQueue.add({
-    id: jobId,
-  });
+const addJobToQueue = async jobId => {
+    jobQueue.add({
+        id: jobId,
+    });
 };
 
 module.exports = {
-  addJobToQueue,
+    addJobToQueue,
 };
